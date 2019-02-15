@@ -11,28 +11,14 @@ Please note that this version of mysql_fdw works with PostgreSQL and EDB Postgre
 
 To compile the [MySQL][1] foreign data wrapper, MySQL's C client library is needed. This library can be downloaded from the official [MySQL website][1].
 
-1. To build on POSIX-compliant systems you need to ensure the `pg_config` executable is in your path when you run `make`. This executable is typically in your PostgreSQL installation's `bin` directory. For example:
+	This one link mysql lib static.
+	Compiled with Visual Studio 2017.
+	Windows SDK 10.0.16299.0
+	
+	Reference: https://blog.2ndquadrant.com/compiling-postgresql-extensions-visual-studio-windows/
+	
+	Based on mysql_fdw 2.5.1 
 
-    ```
-    $ export PATH=/usr/local/pgsql/bin/:$PATH
-    ```
-
-2. The `mysql_config` must also be in the path, it resides in the MySQL `bin` directory.
-
-    ```
-    $ export PATH=/usr/local/mysql/bin/:$PATH
-    ```
-
-3. Compile the code using make.
-
-    ```
-    $ make USE_PGXS=1
-    ```
-
-4.  Finally install the foreign data wrapper.
-
-    ```
-    $ make USE_PGXS=1 install
     ```
 
 Not that we have tested the `mysql_fdw` extension only on MacOS and Ubuntu systems, but other \*NIX's should also work.
