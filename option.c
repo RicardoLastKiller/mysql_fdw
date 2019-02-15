@@ -81,6 +81,8 @@ static struct MySQLFdwOption valid_options[] =
 	{ NULL,			InvalidOid }
 };
 
+PGDLLEXPORT Datum mysql_fdw_validator(PG_FUNCTION_ARGS);
+
 extern Datum mysql_fdw_validator(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(mysql_fdw_validator);

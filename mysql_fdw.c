@@ -19,7 +19,14 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+//#if defined(_MSC_VER) // Microsoft compiler
+//#undef DLFCN_H
+//#include "dlfcn.h"
+//#else
 #include <dlfcn.h>
+//#endif
+
 
 #include <mysql.h>
 #include <errmsg.h>
@@ -80,6 +87,12 @@
 
 #define DEFAULTE_NUM_ROWS    1000
 
+/*
+ * In PG 9.5.1 the number will be 90501,
+ * our version is 2.5.1 so number will be 20501
+ */
+#define CODE_VERSION   20501
+
 PG_MODULE_MAGIC;
 
 
@@ -94,7 +107,7 @@ typedef struct MySQLFdwRelationInfo
 
 } MySQLFdwRelationInfo;
 
-
+PGDLLEXPORT Datum mysql_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum mysql_fdw_handler(PG_FUNCTION_ARGS);
 extern PGDLLEXPORT void _PG_init(void);
 
@@ -102,6 +115,7 @@ bool mysql_load_library(void);
 static void mysql_fdw_exit(int code, Datum arg);
 
 PG_FUNCTION_INFO_V1(mysql_fdw_handler);
+PG_FUNCTION_INFO_V1(mysql_fdw_version);
 
 /*
  * FDW callback routines
@@ -165,6 +179,15 @@ void* mysql_dll_handle = NULL;
 static int wait_timeout = WAIT_TIMEOUT;
 static int interactive_timeout = INTERACTIVE_TIMEOUT;
 
+#if defined(_MSC_VER) // Microsoft compiler
+MYSQL mysql;
+#include <windows.h>
+#elif defined(__GNUC__) // GNU compiler
+#include <dlfcn.h>
+#else
+#error define your copiler
+#endif
+
 /*
  * mysql_load_library function dynamically load the mysql's library
  * libmysqlclient.so. The only reason to load the library using dlopen
@@ -193,18 +216,53 @@ static int interactive_timeout = INTERACTIVE_TIMEOUT;
 bool
 mysql_load_library(void)
 {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__FreeBSD__)
 	/*
 	 * Mac OS/BSD does not support RTLD_DEEPBIND, but it still
 	 * works without the RTLD_DEEPBIND
 	 */
 	mysql_dll_handle = dlopen(_MYSQL_LIBNAME, RTLD_LAZY);
+#elif defined(_MSC_VER)
+	mysql_dll_handle = mysql_init(&mysql);
 #else
-	mysql_dll_handle = dlopen(_MYSQL_LIBNAME, RTLD_LAZY | RTLD_DEEPBIND);
+	mysql_dll_handle = dlopen(_MYSQL_LIBNAME, 0x001);
 #endif
 	if(mysql_dll_handle == NULL)
 		return false;
 
+#if defined(_MSC_VER) // Microsoft compiler
+	_mysql_stmt_bind_param = &mysql_stmt_bind_param;
+	_mysql_stmt_bind_result = &mysql_stmt_bind_result;
+	_mysql_stmt_init = &mysql_stmt_init;
+	_mysql_stmt_prepare = &mysql_stmt_prepare;
+	_mysql_stmt_execute = &mysql_stmt_execute;
+	_mysql_stmt_fetch = &mysql_stmt_fetch;
+	_mysql_query = &mysql_query;
+	_mysql_stmt_result_metadata = &mysql_stmt_result_metadata;
+	_mysql_stmt_store_result = &mysql_stmt_store_result;
+	_mysql_fetch_row = &mysql_fetch_row;
+	_mysql_fetch_field = &mysql_fetch_field;
+	_mysql_fetch_fields = &mysql_fetch_fields;
+	_mysql_stmt_close = &mysql_stmt_close;
+	_mysql_stmt_reset = &mysql_stmt_reset;
+	_mysql_free_result = &mysql_free_result;
+	_mysql_error = &mysql_error;
+	_mysql_options = &mysql_options;
+	_mysql_ssl_set = &mysql_ssl_set;
+	_mysql_real_connect = &mysql_real_connect;
+	_mysql_close = &mysql_close;
+	_mysql_init = &mysql_init;
+	_mysql_stmt_attr_set = &mysql_stmt_attr_set;
+	_mysql_store_result = &mysql_store_result;
+	_mysql_stmt_errno = &mysql_stmt_errno;
+	_mysql_errno = &mysql_errno;
+	_mysql_num_fields = &mysql_num_fields;
+	_mysql_num_rows = &mysql_num_rows;
+	_mysql_get_host_info = &mysql_get_host_info;
+	_mysql_get_server_info = &mysql_get_server_info;
+	_mysql_get_proto_info = &mysql_get_proto_info;
+
+#elif defined(__GNUC__) // GNU compiler
 	_mysql_stmt_bind_param = dlsym(mysql_dll_handle, "mysql_stmt_bind_param");
 	_mysql_stmt_bind_result = dlsym(mysql_dll_handle, "mysql_stmt_bind_result");
 	_mysql_stmt_init = dlsym(mysql_dll_handle, "mysql_stmt_init");
@@ -235,6 +293,8 @@ mysql_load_library(void)
 	_mysql_get_host_info = dlsym(mysql_dll_handle, "mysql_get_host_info");
 	_mysql_get_server_info = dlsym(mysql_dll_handle, "mysql_get_server_info");
 	_mysql_get_proto_info = dlsym(mysql_dll_handle, "mysql_get_proto_info");
+
+#endif
 	
 	if (_mysql_stmt_bind_param == NULL ||
 		_mysql_stmt_bind_result == NULL ||
@@ -419,9 +479,13 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 
 	festate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											  "mysql_fdw temporary data",
+#if PG_VERSION_NUM >= 110000
+											  ALLOCSET_DEFAULT_SIZES);
+#else
 											  ALLOCSET_SMALL_MINSIZE,
 											  ALLOCSET_SMALL_INITSIZE,
 											  ALLOCSET_SMALL_MAXSIZE);
+#endif
 
 	if (wait_timeout > 0)
 	{
@@ -527,10 +591,10 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	foreach(lc, festate->retrieved_attrs)
 	{
 		int attnum = lfirst_int(lc) - 1;
-		Oid pgtype = tupleDescriptor->attrs[attnum]->atttypid;
-		int32 pgtypmod = tupleDescriptor->attrs[attnum]->atttypmod;
+		Oid pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
+		int32 pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
 
-		if (tupleDescriptor->attrs[attnum]->attisdropped)
+		if (TupleDescAttr(tupleDescriptor, attnum)->attisdropped)
 			continue;
 
 		festate->table->column[atindex]._mysql_bind = &festate->table->_mysql_bind[atindex];
@@ -633,8 +697,8 @@ mysqlIterateForeignScan(ForeignScanState *node)
 		foreach(lc, festate->retrieved_attrs)
 		{
 			int attnum = lfirst_int(lc) - 1;
-			Oid pgtype = tupleDescriptor->attrs[attnum]->atttypid;
-			int32 pgtypmod = tupleDescriptor->attrs[attnum]->atttypmod;
+			Oid pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
+			int32 pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
 
 			tupleSlot->tts_isnull[attnum] = festate->table->column[attid].is_null;
 			if (!festate->table->column[attid].is_null)
@@ -692,10 +756,17 @@ mysqlExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	if (es->verbose)
 	{
 		if (strcmp(options->svr_address, "127.0.0.1") == 0 || strcmp(options->svr_address, "localhost") == 0)
+#if PG_VERSION_NUM >= 110000
+			ExplainPropertyInteger("Local server startup cost", NULL, 10, es);
+#else
 			ExplainPropertyLong("Local server startup cost", 10, es);
+#endif
 		else
+#if PG_VERSION_NUM >= 110000
+			ExplainPropertyInteger("Remote server startup cost", NULL, 25, es);
+#else
 			ExplainPropertyLong("Remote server startup cost", 25, es);
-
+#endif
 		ExplainPropertyText("Remote query", festate->query, es);
 	}
 }
@@ -1279,7 +1350,7 @@ mysqlPlanForeignModify(PlannerInfo *root,
 
 		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 		{
-			Form_pg_attribute attr = tupdesc->attrs[attnum - 1];
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 			if (!attr->attisdropped)
 				targetAttrs = lappend_int(targetAttrs, attnum);
@@ -1315,7 +1386,11 @@ mysqlPlanForeignModify(PlannerInfo *root,
 		targetAttrs = lcons_int(1, targetAttrs);
 	}
 
+#if PG_VERSION_NUM >= 110000
+	attname = get_attname(foreignTableId, 1, false);
+#else
 	attname = get_relid_attribute_name(foreignTableId, 1);
+#endif
 
 	/*
 	 * Construct the SQL command string.
@@ -1400,15 +1475,19 @@ mysqlBeginForeignModify(ModifyTableState *mtstate,
 	fmstate->p_nums = 0;
 	fmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											  "mysql_fdw temporary data",
+#if PG_VERSION_NUM >= 110000
+											  ALLOCSET_DEFAULT_SIZES);
+#else
 											  ALLOCSET_SMALL_MINSIZE,
 											  ALLOCSET_SMALL_INITSIZE,
 											  ALLOCSET_SMALL_MAXSIZE);
+#endif
 
 	/* Set up for remaining transmittable parameters */
 	foreach(lc, fmstate->retrieved_attrs)
 	{
 		int attnum = lfirst_int(lc);
-		Form_pg_attribute attr = RelationGetDescr(rel)->attrs[attnum - 1];
+		Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
 
 		Assert(!attr->attisdropped);
 
@@ -1496,7 +1575,7 @@ mysqlExecForeignInsert(EState *estate,
 		int attnum = lfirst_int(lc) - 1;
 
 		bool *isnull = (bool*) palloc0(sizeof(bool) * n_params);
-		Oid type = slot->tts_tupleDescriptor->attrs[attnum]->atttypid;
+		Oid type = TupleDescAttr(slot->tts_tupleDescriptor, attnum)->atttypid;
 
 		value = slot_getattr(slot, attnum + 1, &isnull[attnum]);
 
@@ -1604,7 +1683,7 @@ mysqlExecForeignUpdate(EState *estate,
 		if (attnum == 1)
 			continue;
 
-		type = slot->tts_tupleDescriptor->attrs[attnum - 1]->atttypid;
+		type = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->atttypid;
 		value = slot_getattr(slot, attnum, (bool*)(&isnull[i]));
 
 		mysql_bind_sql_var(type, bindnum, value, mysql_bind_buffer, &isnull[i]);
@@ -1681,7 +1760,7 @@ mysqlAddForeignUpdateTargets(Query *parsetree,
 	 * What we need is the rowid which is the first column
 	 */
 	Form_pg_attribute attr =
-	RelationGetDescr(target_relation)->attrs[0];
+				TupleDescAttr(RelationGetDescr(target_relation), 0);
 
 	/* Make a Var representing the desired value */
 	var = makeVar(parsetree->resultRelation,
@@ -1901,8 +1980,10 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
                      "    WHEN c.DATA_TYPE = 'datetime' THEN 'timestamp'"
                      "    WHEN c.DATA_TYPE = 'longtext' THEN 'text'"
                      "    WHEN c.DATA_TYPE = 'mediumtext' THEN 'text'"
+                     "    WHEN c.DATA_TYPE = 'tinytext' THEN 'text'"
                      "    WHEN c.DATA_TYPE = 'blob' THEN 'bytea'"
                      "    WHEN c.DATA_TYPE = 'mediumblob' THEN 'bytea'"
+                     "    WHEN c.DATA_TYPE = 'longblob' THEN 'bytea'"
                      "    ELSE c.DATA_TYPE"
                      "  END,"
                      "  c.COLUMN_TYPE,"
@@ -2090,7 +2171,7 @@ prepare_query_params(PlanState *node,
 		Oid			typefnoid;
 		bool		isvarlena;
 
-		*param_types[i] = exprType(param_expr);
+		(*param_types)[i] = exprType(param_expr);
 
 		getTypeOutputInfo(exprType(param_expr), &typefnoid, &isvarlena);
 		fmgr_info(typefnoid, &(*param_flinfo)[i]);
@@ -2105,7 +2186,11 @@ prepare_query_params(PlanState *node,
 	 * benefit, and it'd require postgres_fdw to know more than is desirable
 	 * about Param evaluation.)
 	 */
+#if PG_VERSION_NUM >= 100000
+	*param_exprs = ExecInitExprList(fdw_exprs, node);
+#else
 	*param_exprs = (List *) ExecInitExpr((Expr *) fdw_exprs, node);
+#endif
 
 	/* Allocate buffer for text form of query parameters. */
 	*param_values = (const char **) palloc0(numParams * sizeof(char *));
@@ -2198,3 +2283,8 @@ create_cursor(ForeignScanState *node)
 	}
 }
 
+Datum
+mysql_fdw_version(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(CODE_VERSION);
+}
